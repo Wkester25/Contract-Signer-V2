@@ -55,4 +55,29 @@ class Config:
     )
     STAMP_DATETIME_FORMAT = os.environ.get("STAMP_DATETIME_FORMAT", "%Y-%m-%d %H:%M:%S UTC")
 
+    # --- PostgreSQL: where the contract hash record is stored ---
+    # Either set DATABASE_URL as a single connection string, e.g.
+    #   postgresql://user:password@host:5432/dbname?sslmode=require
+    # or leave it unset and configure the individual POSTGRES_* values below.
+    # DATABASE_URL wins if both are set.
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+
+    POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "localhost")
+    POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
+    POSTGRES_DB = os.environ.get("POSTGRES_DB", "contract_pipeline")
+    POSTGRES_USER = os.environ.get("POSTGRES_USER", "contract_pipeline")
+    POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
+    # require/verify-full recommended once you have real certs in production;
+    # prefer is a safe default that still works against a plain local/dev DB.
+    POSTGRES_SSLMODE = os.environ.get("POSTGRES_SSLMODE", "prefer")
+    POSTGRES_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("POSTGRES_CONNECT_TIMEOUT_SECONDS", "10"))
+    POSTGRES_APPLICATION_NAME = os.environ.get(
+        "POSTGRES_APPLICATION_NAME", "contract-signing-pipeline"
+    )
+    # Schema/table names are configurable too - identifiers are safely quoted
+    # via psycopg2.sql wherever they're used, so any valid Postgres
+    # identifier works without risking SQL injection through config.
+    POSTGRES_SCHEMA = os.environ.get("POSTGRES_SCHEMA", "public")
+    POSTGRES_TABLE = os.environ.get("POSTGRES_TABLE", "signed_contracts")
+
     PORT = int(os.environ.get("PORT", "8443"))

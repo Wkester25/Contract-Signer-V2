@@ -9,9 +9,10 @@ Two programs on two machines:
   over a signed HTTP request.
 - **Program 2** (`program2_contract_merge/`) — verifies the signed request,
   merges the signature SVG and an account-number/saved-at stamp onto the
-  blank contract (`contract_merge.py`), and saves the finished PDF under a
+  blank contract (`contract_merge.py`), saves the finished PDF under a
   filename derived from the account number and save timestamp
-  (`storage.py`). Hashing it into Postgres and printing it are still pending.
+  (`storage.py`), hashes it, and records that hash in PostgreSQL
+  (`db.py`). Printing it is still pending.
 
 Both programs share `shared/signing.py`, an HMAC scheme (mirroring Stripe's
 own) used to authenticate the Program1 → Program2 call and reject replays.
@@ -25,7 +26,7 @@ own) used to authenticate the Program1 → Program2 call and reject replays.
 - [x] Program 2: verify signature, confirm account number/SVG/contract arrive intact
 - [x] Program 2: merge signature onto contract at a configurable location, render PDF, stamp account number + save timestamp (also written into PDF metadata as `/AccountNumber` / `/SignedAt`)
 - [x] Program 2: save signed contract as `<account_number>_<timestamp>.pdf` under a configurable output dir, sanitized against path traversal, written atomically, collision-safe
-- [ ] Program 2: hash the saved PDF (SHA-256) and store it in PostgreSQL with account number + timestamp
+- [x] Program 2: hash the saved PDF (SHA-256) and store it in PostgreSQL with account number + timestamp, all connection/schema/table parameters configurable
 - [ ] Program 2: print the finished contract via CUPS
 
 ## Setup
@@ -129,11 +130,58 @@ number ultimately traces back to a webhook payload relayed over the network:
   and `os.replace()`d into place, so a crash mid-write can't leave a
   truncated/corrupt file sitting at the real filename.
 
+## PostgreSQL storage (Program 2)
+
+Every configurable connection parameter lives in `program2_contract_merge/config.py`:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | unset | Full connection string, e.g. `postgresql://user:pass@host:5432/db?sslmode=require` - wins over the individual vars below if set |
+| `POSTGRES_HOST` | `localhost` | |
+| `POSTGRES_PORT` | `5432` | |
+| `POSTGRES_DB` | `contract_pipeline` | |
+| `POSTGRES_USER` | `contract_pipeline` | |
+| `POSTGRES_PASSWORD` | *(empty)* | |
+| `POSTGRES_SSLMODE` | `prefer` | Use `require`/`verify-full` in production once you have real certs |
+| `POSTGRES_CONNECT_TIMEOUT_SECONDS` | `10` | |
+| `POSTGRES_APPLICATION_NAME` | `contract-signing-pipeline` | Shows up in `pg_stat_activity` |
+| `POSTGRES_SCHEMA` | `public` | |
+| `POSTGRES_TABLE` | `signed_contracts` | |
+
+Schema/table names aren't just string-formatted into SQL - they're built
+with `psycopg2.sql.Identifier`, which quotes them safely, so any valid
+Postgres identifier works (tested with a deliberately awkward
+`"Weird-Table Name"` value). Query *values* (account number, hash, etc.)
+always go through parameterized placeholders.
+
+**Schema**: Program 2 runs `CREATE TABLE IF NOT EXISTS` (+ two indexes) for
+the configured schema/table once at startup - no manual migration needed in
+the common case. `schema.sql` is included as a reference / for environments
+where the app's DB role can't run DDL itself.
+
+**What's stored**: one row per successfully saved contract -
+`account_number`, `file_path` (where the PDF landed), `sha256_hash` (of the
+bytes actually on disk, read back after the atomic write - not just the
+in-memory copy), `captured_at` (when Stripe captured the signature),
+`saved_at` (when Program 2 saved it), `created_at` (row insert time).
+
+**Known limitation**: if the database write fails *after* the PDF has
+already been saved to disk, Program 2 returns 500 so Stripe/Program 1
+retry - but a retry re-runs the whole flow from Program 1, producing a
+second saved PDF (collision-safe filename, so nothing is overwritten) and a
+second hash row, rather than resuming the original one. There's no
+idempotency key across the two programs yet to collapse these into a single
+attempt. Worth knowing if you see occasional duplicate rows for the same
+account after a DB blip - say the word if you'd like that tightened up.
+
 ## Running the smoke test locally
 
 This exercises the full chain — including the real file-ID → Files API
-download step — without real Stripe Terminal hardware or a live Stripe
-account, using a fake Stripe Files server and a correctly-signed fake event.
+download step and a real Postgres round-trip — without real Stripe Terminal
+hardware or a live Stripe account, using a fake Stripe Files server and a
+correctly-signed fake event. You need a reachable Postgres instance; any
+throwaway local one works (`createdb contract_pipeline` against your own
+Postgres is enough - Program 2 creates the table itself at startup).
 
 ```bash
 # terminal 1 - fake Stripe Files API (serves the file ID -> SVG download)
@@ -144,6 +192,7 @@ cd program2_contract_merge
 RELAY_SHARED_SECRET=test-shared-secret \
 RECEIVED_DUMP_DIR=/tmp/program2_received \
 OUTPUT_DIR=/tmp/program2_signed \
+DATABASE_URL=postgresql://contract_pipeline:yourpassword@localhost:5432/contract_pipeline \
 PORT=8443 python3 app.py
 
 # terminal 3 - Program 1
@@ -172,14 +221,18 @@ the raw debug inputs (`blank_contract.pdf`, `signature.svg`, `meta.txt` -
 the latter now also records the final saved path) for troubleshooting a bad
 merge without re-triggering a signature.
 
-Confirmed working end-to-end in this environment: Program 1 actually
-calling out to `GET /v1/files/<id>` then `GET /v1/files/<id>/contents` for
-the download (visible in Program 1's logs); the merge producing a correctly
-stamped single-page PDF with `/AccountNumber` and `/SignedAt` metadata set;
-the failure event being acknowledged without any forward attempt; and two
-back-to-back events for the same account both landing safely on disk with
-distinct filenames rather than one clobbering the other. **In production,
-omit `STRIPE_API_BASE`** so the SDK talks to the real `api.stripe.com`.
+Confirmed working end-to-end in this environment against a real local
+Postgres 18 instance: Program 1 actually calling out to `GET /v1/files/<id>`
+then `GET /v1/files/<id>/contents` for the download (visible in Program 1's
+logs); the merge producing a correctly stamped single-page PDF with
+`/AccountNumber` and `/SignedAt` metadata set; the failure event being
+acknowledged without any forward attempt; two back-to-back events for the
+same account both landing safely on disk with distinct filenames rather
+than one clobbering the other; the hash of each saved PDF independently
+recomputed and confirmed to match the row Postgres stored; and (by
+stopping Postgres mid-test) confirmed the documented failure mode above -
+PDF still saved, 500 returned, nothing silently lost. **In production, omit
+`STRIPE_API_BASE`** so the SDK talks to the real `api.stripe.com`.
 
 ## Security notes
 

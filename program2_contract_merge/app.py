@@ -3,12 +3,13 @@ Program 2 - contract merge service.
 
 Receives the signed relay call from Program 1, verifies it, merges the
 signature SVG + an account-number/saved-at stamp onto the blank contract,
-and saves the finished PDF under a filename derived from the account
-number and the save timestamp.
+saves the finished PDF under a filename derived from the account number and
+the save timestamp, hashes it, and records that hash in Postgres.
 
-Hashing the saved PDF into Postgres and printing it come next.
+Printing the finished contract comes next.
 """
 import base64
+import hashlib
 import logging
 import sys
 from datetime import datetime, timezone
@@ -22,11 +23,22 @@ from shared.signing import verify_signature, SignatureVerificationError  # noqa:
 from config import Config  # noqa: E402
 from contract_merge import merge_signature_and_stamp, ContractMergeError, Placement  # noqa: E402
 from storage import build_output_path, save_contract, StorageError  # noqa: E402
+import db  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("program2")
 
 app = Flask(__name__)
+
+try:
+    with db.get_connection() as _conn:
+        db.ensure_schema(_conn)
+    log.info("Postgres schema ready (%s.%s)", Config.POSTGRES_SCHEMA, Config.POSTGRES_TABLE)
+except db.DatabaseError as exc:
+    # Don't crash the app on startup - /healthz should still respond, and
+    # each webhook request will surface the same error loudly if the
+    # database is genuinely unreachable (rather than just starting slow).
+    log.error("Could not ensure Postgres schema at startup: %s", exc)
 
 
 @app.route("/webhook/contract", methods=["POST"])
@@ -98,6 +110,31 @@ def receive_contract():
         # 500 - disk/permission problem is worth Stripe/Program 1 retrying.
         return jsonify(error="failed to save contract"), 500
 
+    # Hash what's actually on disk (not the in-memory bytes) - a faithful
+    # hash of "that contract" as stored, catching any write-path corruption
+    # too, however unlikely.
+    sha256_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
+
+    try:
+        captured_at_dt = datetime.fromisoformat(captured_at) if captured_at else None
+        with db.get_connection() as conn:
+            row_id = db.insert_contract_record(
+                conn,
+                account_number=account_number,
+                file_path=str(output_path),
+                sha256_hash=sha256_hash,
+                captured_at=captured_at_dt,
+                saved_at=saved_at,
+            )
+    except db.DatabaseError as exc:
+        log.error("Failed to record hash for account %s: %s", account_number, exc)
+        # 500 - the PDF is already safely on disk at this point; this is a
+        # DB connectivity problem worth retrying. Note a retry re-runs the
+        # whole flow from Program 1, so it will produce a second saved PDF
+        # (collision-safe filename) and a second hash row rather than
+        # resuming this one - see README "Known limitations".
+        return jsonify(error="failed to record contract hash"), 500
+
     # DEBUG: also dump the raw inputs for troubleshooting a bad merge
     # without re-triggering a real signature capture. Not the real save.
     debug_dir = Path(Config.RECEIVED_DUMP_DIR) / account_number
@@ -106,18 +143,31 @@ def receive_contract():
     (debug_dir / contract_filename).write_bytes(contract_bytes)
     (debug_dir / "meta.txt").write_text(
         f"account_number={account_number}\ncaptured_at={captured_at}\n"
-        f"saved_at={saved_at.isoformat()}\nsaved_path={output_path}\n",
+        f"saved_at={saved_at.isoformat()}\nsaved_path={output_path}\n"
+        f"sha256={sha256_hash}\ndb_id={row_id}\n",
         encoding="utf-8",
     )
 
     log.info(
-        "Saved signed contract for account %s (captured %s, saved %s) -> %s",
+        "Saved + recorded signed contract for account %s (captured %s, saved %s) -> %s "
+        "(sha256=%s, db_id=%s)",
         account_number,
         captured_at,
         saved_at_text,
         output_path,
+        sha256_hash,
+        row_id,
     )
-    return jsonify(status="saved", account_number=account_number, path=str(output_path)), 200
+    return (
+        jsonify(
+            status="saved",
+            account_number=account_number,
+            path=str(output_path),
+            sha256=sha256_hash,
+            db_id=row_id,
+        ),
+        200,
+    )
 
 
 @app.route("/healthz", methods=["GET"])
