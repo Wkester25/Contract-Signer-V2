@@ -16,10 +16,20 @@ class Config:
     # rejected as a possible replay.
     SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SIGNATURE_TOLERANCE_SECONDS", "300"))
 
-    # STUB-ONLY: where this placeholder receiver drops what it got, so you
-    # can eyeball that account number / signature / contract all arrived
-    # intact. Real merge/PDF/hash/DB/print logic replaces this in later steps.
+    # DEBUG-ONLY: where the receiver additionally drops the raw inputs it got
+    # (signature.svg, the blank contract, a meta.txt) for troubleshooting a
+    # bad merge without re-triggering a real signature capture. Not the real
+    # save location - see OUTPUT_DIR below for that.
     RECEIVED_DUMP_DIR = os.environ.get("RECEIVED_DUMP_DIR", "/tmp/program2_received")
+
+    # --- Where finished, signed contracts are actually saved ---
+    OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/var/contract-pipeline/signed")
+    # {account_number} and {saved_at} are substituted in. saved_at here uses
+    # FILENAME_DATETIME_FORMAT - deliberately a *different* format from
+    # STAMP_DATETIME_FORMAT above, since filenames can't safely contain the
+    # colons/spaces that make a good on-page timestamp.
+    FILENAME_TEMPLATE = os.environ.get("FILENAME_TEMPLATE", "{account_number}_{saved_at}.pdf")
+    FILENAME_DATETIME_FORMAT = os.environ.get("FILENAME_DATETIME_FORMAT", "%Y%m%d-%H%M%S")
 
     # --- Signature placement on the contract ---
     # All coordinates are in PDF points (72/inch), origin at the bottom-left

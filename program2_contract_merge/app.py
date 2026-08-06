@@ -1,14 +1,12 @@
 """
 Program 2 - contract merge service.
 
-Receives the signed relay call from Program 1, verifies it, and merges the
-signature SVG + an account-number/saved-at stamp onto the blank contract to
-produce a finished PDF.
+Receives the signed relay call from Program 1, verifies it, merges the
+signature SVG + an account-number/saved-at stamp onto the blank contract,
+and saves the finished PDF under a filename derived from the account
+number and the save timestamp.
 
-Still stub-level beyond this point: the finished PDF is written under
-RECEIVED_DUMP_DIR for inspection rather than saved to its real destination.
-Stage 3 replaces that with the actual account-number-named save path; hash
-+ Postgres storage and printing come after that.
+Hashing the saved PDF into Postgres and printing it come next.
 """
 import base64
 import logging
@@ -23,6 +21,7 @@ from shared.signing import verify_signature, SignatureVerificationError  # noqa:
 
 from config import Config  # noqa: E402
 from contract_merge import merge_signature_and_stamp, ContractMergeError, Placement  # noqa: E402
+from storage import build_output_path, save_contract, StorageError  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("program2")
@@ -81,26 +80,44 @@ def receive_contract():
         # itself on retry, so don't have Program 1/Stripe hammer it.
         return jsonify(error=str(exc)), 200
 
-    # STUB: dump inputs + the merged PDF for inspection. Stage 3 replaces
-    # this with saving to the real configured output location.
-    out_dir = Path(Config.RECEIVED_DUMP_DIR) / account_number
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "signature.svg").write_bytes(signature_svg_bytes)
-    (out_dir / contract_filename).write_bytes(contract_bytes)
-    (out_dir / "merged_preview.pdf").write_bytes(merged_pdf_bytes)
-    (out_dir / "meta.txt").write_text(
-        f"account_number={account_number}\ncaptured_at={captured_at}\nsaved_at={saved_at.isoformat()}\n",
+    try:
+        output_path = build_output_path(
+            output_dir=Path(Config.OUTPUT_DIR),
+            account_number=account_number,
+            saved_at=saved_at,
+            filename_template=Config.FILENAME_TEMPLATE,
+            filename_datetime_format=Config.FILENAME_DATETIME_FORMAT,
+        )
+        save_contract(merged_pdf_bytes, output_path)
+    except StorageError as exc:
+        log.error("Refused to save contract for account %s: %s", account_number, exc)
+        # 200 - an unsafe/invalid account number won't become safe on retry.
+        return jsonify(error=str(exc)), 200
+    except OSError as exc:
+        log.error("Failed to write contract for account %s to disk: %s", account_number, exc)
+        # 500 - disk/permission problem is worth Stripe/Program 1 retrying.
+        return jsonify(error="failed to save contract"), 500
+
+    # DEBUG: also dump the raw inputs for troubleshooting a bad merge
+    # without re-triggering a real signature capture. Not the real save.
+    debug_dir = Path(Config.RECEIVED_DUMP_DIR) / account_number
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / "signature.svg").write_bytes(signature_svg_bytes)
+    (debug_dir / contract_filename).write_bytes(contract_bytes)
+    (debug_dir / "meta.txt").write_text(
+        f"account_number={account_number}\ncaptured_at={captured_at}\n"
+        f"saved_at={saved_at.isoformat()}\nsaved_path={output_path}\n",
         encoding="utf-8",
     )
 
     log.info(
-        "Merged contract for account %s (captured %s, saved %s) - wrote %s",
+        "Saved signed contract for account %s (captured %s, saved %s) -> %s",
         account_number,
         captured_at,
         saved_at_text,
-        out_dir,
+        output_path,
     )
-    return jsonify(status="merged", account_number=account_number), 200
+    return jsonify(status="saved", account_number=account_number, path=str(output_path)), 200
 
 
 @app.route("/healthz", methods=["GET"])
