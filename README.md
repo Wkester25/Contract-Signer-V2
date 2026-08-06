@@ -7,11 +7,11 @@ Two programs on two machines:
   terminal, loads the blank contract template from local disk, and forwards
   `{account_number, signature_svg, blank_contract, captured_at}` to Program 2
   over a signed HTTP request.
-- **Program 2** (`program2_contract_merge/`) — currently a **stub**. It
-  verifies the signed request and writes what it received to disk so you can
-  confirm the handoff works. It will be extended to do the real work: merge
-  the signature onto the contract, render a PDF, save it under a filename
-  derived from the account number, hash it into Postgres, and print it.
+- **Program 2** (`program2_contract_merge/`) — verifies the signed request
+  and merges the signature SVG and an account-number/saved-at stamp onto
+  the blank contract to produce a finished PDF (`contract_merge.py`).
+  Saving that PDF to its real destination, hashing it into Postgres, and
+  printing it are still stubbed/pending.
 
 Both programs share `shared/signing.py`, an HMAC scheme (mirroring Stripe's
 own) used to authenticate the Program1 → Program2 call and reject replays.
@@ -22,8 +22,8 @@ own) used to authenticate the Program1 → Program2 call and reject replays.
       download SVG from Files API → relay to Program 2
 - [x] Program 1: guards against other reader-action-succeeded events, handles
       action_failed (cancel/timeout) as a no-op
-- [x] Program 2 stub: verify signature, confirm account number/SVG/contract arrive intact
-- [ ] Program 2: merge signature onto contract at a configurable location, render PDF, stamp account number + save timestamp
+- [x] Program 2: verify signature, confirm account number/SVG/contract arrive intact
+- [x] Program 2: merge signature onto contract at a configurable location, render PDF, stamp account number + save timestamp (also written into PDF metadata as `/AccountNumber` / `/SignedAt`)
 - [ ] Program 2: save signed contract as `<account_number>.pdf` under a configurable output dir
 - [ ] Program 2: hash the saved PDF (SHA-256) and store it in PostgreSQL with account number + timestamp
 - [ ] Program 2: print the finished contract via CUPS
@@ -78,6 +78,31 @@ and point `ACCOUNT_NUMBER_PATH` at that. If it comes from somewhere else
 entirely (looked up from the linked PaymentIntent, the connected account ID,
 etc.), tell me and I'll adjust `extract_account_number()` to match.
 
+## Signature/stamp placement (Program 2)
+
+Configurable via env vars in `program2_contract_merge/config.py` — all
+coordinates are PDF points (72/inch), origin bottom-left of the page, page
+number is 1-indexed (`-1` = last page):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SIGNATURE_PAGE_NUMBER` | `-1` | Page the signature is drawn on |
+| `SIGNATURE_X` / `SIGNATURE_Y` | `72` / `110` | Anchor point (bottom-left of the signature's bounding box) |
+| `SIGNATURE_MAX_WIDTH` / `SIGNATURE_MAX_HEIGHT` | `220` / `70` | Box the signature is scaled to fit inside, aspect ratio preserved |
+| `STAMP_PAGE_NUMBER`, `STAMP_X`, `STAMP_Y` | `-1`, `72`, `70` | Where the account-number/saved-at line is drawn |
+| `STAMP_TEXT_TEMPLATE` | `"Account: {account_number}    Signed: {saved_at}"` | Format string |
+| `STAMP_DATETIME_FORMAT` | `"%Y-%m-%d %H:%M:%S UTC"` | strftime pattern for the saved-at timestamp |
+
+These defaults were only tuned against the test fixture contract generated
+for local testing — **you'll need to adjust `SIGNATURE_X/Y` and
+`STAMP_X/Y` against your real contract template** so the signature lands on
+the actual signature line rather than wherever these placeholders happen to
+put it.
+
+The "saved at" timestamp is when Program 2 processes the request (not when
+Stripe captured the signature — that's `captured_at`, still logged
+separately), matching "the time and date it was saved."
+
 ## Running the smoke test locally
 
 This exercises the full chain — including the real file-ID → Files API
@@ -115,12 +140,14 @@ python3 scripts/simulate_stripe_failure_event.py
 ```
 
 Check `/tmp/program2_received/ACC-00123/` for `blank_contract.pdf`,
-`signature.svg`, and `meta.txt`. Confirmed working end-to-end in this
-environment, including Program 1 actually calling out to
-`GET /v1/files/<id>` then `GET /v1/files/<id>/contents` for the download
-(visible in Program 1's logs), and the failure event being acknowledged
-without any forward attempt. **In production, omit `STRIPE_API_BASE`** so
-the SDK talks to the real `api.stripe.com`.
+`signature.svg`, `merged_preview.pdf` (the actual merged/signed/stamped
+output), and `meta.txt`. Confirmed working end-to-end in this environment,
+including Program 1 actually calling out to `GET /v1/files/<id>` then
+`GET /v1/files/<id>/contents` for the download (visible in Program 1's
+logs), the merge producing a correctly stamped single-page PDF with
+`/AccountNumber` and `/SignedAt` metadata set, and the failure event being
+acknowledged without any forward attempt. **In production, omit
+`STRIPE_API_BASE`** so the SDK talks to the real `api.stripe.com`.
 
 ## Security notes
 
