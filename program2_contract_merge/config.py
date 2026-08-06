@@ -80,4 +80,13 @@ class Config:
     POSTGRES_SCHEMA = os.environ.get("POSTGRES_SCHEMA", "public")
     POSTGRES_TABLE = os.environ.get("POSTGRES_TABLE", "signed_contracts")
 
+    # --- Printing (CUPS, via the `lp` command) ---
+    PRINT_ENABLED = os.environ.get("PRINT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    # Empty string = system default CUPS destination (`lp` with no -d flag).
+    PRINTER_NAME = os.environ.get("PRINTER_NAME", "")
+    PRINT_COPIES = int(os.environ.get("PRINT_COPIES", "1"))
+    # Comma-separated key=value CUPS options, e.g. "media=Letter,sides=one-sided"
+    PRINT_OPTIONS = os.environ.get("PRINT_OPTIONS", "")
+    PRINT_TIMEOUT_SECONDS = float(os.environ.get("PRINT_TIMEOUT_SECONDS", "30"))
+
     PORT = int(os.environ.get("PORT", "8443"))

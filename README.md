@@ -11,8 +11,8 @@ Two programs on two machines:
   merges the signature SVG and an account-number/saved-at stamp onto the
   blank contract (`contract_merge.py`), saves the finished PDF under a
   filename derived from the account number and save timestamp
-  (`storage.py`), hashes it, and records that hash in PostgreSQL
-  (`db.py`). Printing it is still pending.
+  (`storage.py`), hashes it, records that hash in PostgreSQL (`db.py`),
+  and prints it via CUPS (`printing.py`). All five stages are complete.
 
 Both programs share `shared/signing.py`, an HMAC scheme (mirroring Stripe's
 own) used to authenticate the Program1 → Program2 call and reject replays.
@@ -27,7 +27,7 @@ own) used to authenticate the Program1 → Program2 call and reject replays.
 - [x] Program 2: merge signature onto contract at a configurable location, render PDF, stamp account number + save timestamp (also written into PDF metadata as `/AccountNumber` / `/SignedAt`)
 - [x] Program 2: save signed contract as `<account_number>_<timestamp>.pdf` under a configurable output dir, sanitized against path traversal, written atomically, collision-safe
 - [x] Program 2: hash the saved PDF (SHA-256) and store it in PostgreSQL with account number + timestamp, all connection/schema/table parameters configurable
-- [ ] Program 2: print the finished contract via CUPS
+- [x] Program 2: print the finished contract via CUPS (`lp`), configurable printer/copies/options, failures logged for manual reprint rather than blocking the webhook
 
 ## Setup
 
@@ -38,9 +38,16 @@ pip install -r program1_stripe_relay/requirements.txt
 pip install -r program2_contract_merge/requirements.txt
 ```
 
+Program 2's machine also needs the `lp` command available system-wide
+(`sudo apt install cups-client` on Debian/Ubuntu, or whatever installs a
+CUPS client on your distro) - it's not a pip package, `printing.py` shells
+out to it directly. Set `PRINT_ENABLED=false` if this machine doesn't have
+a printer/CUPS client and shouldn't try.
+
 Copy `program1_stripe_relay/.env.example` to `.env` in that directory and
-fill in real values. Program 2 needs `RELAY_SHARED_SECRET` (same value as
-Program 1) in its own environment.
+fill in real values. Program 2 needs its own `.env` (see
+`program2_contract_merge/.env.example`), with `RELAY_SHARED_SECRET` matching
+Program 1's.
 
 ## The Stripe event shape
 
@@ -174,14 +181,42 @@ idempotency key across the two programs yet to collapse these into a single
 attempt. Worth knowing if you see occasional duplicate rows for the same
 account after a DB blip - say the word if you'd like that tightened up.
 
+## Printing (Program 2)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PRINT_ENABLED` | `true` | Set `false` to skip printing entirely (e.g. a staging box with no printer attached) |
+| `PRINTER_NAME` | *(empty)* | CUPS destination name - empty means the system default (`lp` with no `-d`) |
+| `PRINT_COPIES` | `1` | |
+| `PRINT_OPTIONS` | *(empty)* | Comma-separated CUPS options, e.g. `media=Letter,sides=one-sided` - passed through as repeated `-o` flags |
+| `PRINT_TIMEOUT_SECONDS` | `30` | How long to wait on the `lp` command before giving up |
+
+`printing.py` shells out to the standard `lp` command (from `cups-client`)
+rather than binding to libcups directly - `lp` needs no compiled Python
+extension and is exactly what you'd run by hand to confirm printing works.
+
+**Failure handling is deliberately asymmetric with the earlier stages**: by
+the time printing runs, the contract is already safely saved to disk and
+its hash recorded in Postgres - the part that can't be redone without a
+fresh signature. So unlike a DB or storage failure, a print failure does
+**not** return 500 (which would make Stripe/Program 1 retry the whole
+flow and create a duplicate saved file + duplicate DB row just to retry
+printing). Instead it's logged loudly - `"saved+recorded, NOT printed -
+reprint manually"` - and the webhook still returns 200 with
+`print_status: "failed"` in the response body. Use `scripts/reprint.py
+<path-to-pdf>` to retry just the printing step by hand once the printer
+issue is resolved.
+
 ## Running the smoke test locally
 
 This exercises the full chain — including the real file-ID → Files API
-download step and a real Postgres round-trip — without real Stripe Terminal
-hardware or a live Stripe account, using a fake Stripe Files server and a
-correctly-signed fake event. You need a reachable Postgres instance; any
-throwaway local one works (`createdb contract_pipeline` against your own
-Postgres is enough - Program 2 creates the table itself at startup).
+download step, a real Postgres round-trip, and a real CUPS print submission
+— without real Stripe Terminal hardware or a live Stripe account, using a
+fake Stripe Files server and a correctly-signed fake event. You need a
+reachable Postgres instance (`createdb contract_pipeline` against your own
+Postgres is enough - Program 2 creates the table itself at startup) and a
+CUPS instance with at least one configured destination (`lpstat -p` to list
+yours - or set `PRINT_ENABLED=false` to skip printing for this test).
 
 ```bash
 # terminal 1 - fake Stripe Files API (serves the file ID -> SVG download)
@@ -193,6 +228,7 @@ RELAY_SHARED_SECRET=test-shared-secret \
 RECEIVED_DUMP_DIR=/tmp/program2_received \
 OUTPUT_DIR=/tmp/program2_signed \
 DATABASE_URL=postgresql://contract_pipeline:yourpassword@localhost:5432/contract_pipeline \
+PRINTER_NAME=your-printer-name \
 PORT=8443 python3 app.py
 
 # terminal 3 - Program 1
@@ -216,23 +252,39 @@ python3 scripts/simulate_stripe_failure_event.py
 ```
 
 The real, finished contract lands in `/tmp/program2_signed/` as
-`ACC-00123_<timestamp>.pdf`. `/tmp/program2_received/ACC-00123/` still gets
-the raw debug inputs (`blank_contract.pdf`, `signature.svg`, `meta.txt` -
-the latter now also records the final saved path) for troubleshooting a bad
-merge without re-triggering a signature.
+`ACC-00123_<timestamp>.pdf`, gets recorded in Postgres, and gets submitted
+to `PRINTER_NAME`. `/tmp/program2_received/ACC-00123/` still gets the raw
+debug inputs (`blank_contract.pdf`, `signature.svg`, `meta.txt` - now also
+recording the saved path, hash, DB id, and print status) for troubleshooting
+a bad merge without re-triggering a signature.
+
+If printing fails (bad printer name, CUPS unreachable, etc.), the response
+still comes back 200 with `print_status: "failed"` - the file and DB row are
+already in place regardless. Retry just the print step by hand with:
+
+```bash
+python3 scripts/reprint.py --printer your-printer-name /tmp/program2_signed/ACC-00123_<timestamp>.pdf
+```
 
 Confirmed working end-to-end in this environment against a real local
-Postgres 18 instance: Program 1 actually calling out to `GET /v1/files/<id>`
-then `GET /v1/files/<id>/contents` for the download (visible in Program 1's
-logs); the merge producing a correctly stamped single-page PDF with
-`/AccountNumber` and `/SignedAt` metadata set; the failure event being
-acknowledged without any forward attempt; two back-to-back events for the
-same account both landing safely on disk with distinct filenames rather
-than one clobbering the other; the hash of each saved PDF independently
-recomputed and confirmed to match the row Postgres stored; and (by
-stopping Postgres mid-test) confirmed the documented failure mode above -
-PDF still saved, 500 returned, nothing silently lost. **In production, omit
-`STRIPE_API_BASE`** so the SDK talks to the real `api.stripe.com`.
+Postgres 18 instance and a real local CUPS instance (no docker/root
+available, so both were run from their unpacked `.deb` binaries in
+userspace specifically to test this against the real thing rather than
+mocks): Program 1 actually calling out to `GET /v1/files/<id>` then
+`GET /v1/files/<id>/contents` for the download; the merge producing a
+correctly stamped single-page PDF with `/AccountNumber` and `/SignedAt`
+metadata set; the failure event being acknowledged without any forward
+attempt; two back-to-back events for the same account both landing safely
+on disk with distinct filenames rather than one clobbering the other; the
+hash of each saved PDF independently recomputed and confirmed to match the
+row Postgres stored; a real print job submitted through `lp` and CUPS with
+the delivered bytes confirmed identical to the saved file; and (by stopping
+Postgres, then by pointing at a nonexistent printer) confirmed both
+documented failure modes - a DB outage still saves the file and returns
+500 for retry, while a print failure still saves + records the contract,
+returns 200, and logs loudly for manual reprint (verified `scripts/reprint.py`
+recovers it). **In production, omit `STRIPE_API_BASE`** so the SDK talks to
+the real `api.stripe.com`.
 
 ## Security notes
 

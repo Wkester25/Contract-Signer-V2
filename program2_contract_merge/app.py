@@ -4,9 +4,7 @@ Program 2 - contract merge service.
 Receives the signed relay call from Program 1, verifies it, merges the
 signature SVG + an account-number/saved-at stamp onto the blank contract,
 saves the finished PDF under a filename derived from the account number and
-the save timestamp, hashes it, and records that hash in Postgres.
-
-Printing the finished contract comes next.
+the save timestamp, hashes it, records that hash in Postgres, and prints it.
 """
 import base64
 import hashlib
@@ -23,6 +21,7 @@ from shared.signing import verify_signature, SignatureVerificationError  # noqa:
 from config import Config  # noqa: E402
 from contract_merge import merge_signature_and_stamp, ContractMergeError, Placement  # noqa: E402
 from storage import build_output_path, save_contract, StorageError  # noqa: E402
+from printing import print_contract, PrintError  # noqa: E402
 import db  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -135,6 +134,36 @@ def receive_contract():
         # resuming this one - see README "Known limitations".
         return jsonify(error="failed to record contract hash"), 500
 
+    # Printing is last and, unlike the steps above, doesn't get to fail the
+    # whole webhook: the contract is already safely saved + hashed, which is
+    # the part that can't be redone without a fresh signature. Returning 500
+    # here would make Stripe/Program 1 retry the *entire* flow just to retry
+    # printing, producing a duplicate saved file and a duplicate DB row (see
+    # README "Known limitations"). So a print failure is logged loudly for
+    # manual follow-up / reprint (see scripts/reprint.py) instead.
+    if Config.PRINT_ENABLED:
+        try:
+            print_detail = print_contract(
+                path=output_path,
+                printer_name=Config.PRINTER_NAME,
+                copies=Config.PRINT_COPIES,
+                options=Config.PRINT_OPTIONS,
+                timeout_seconds=Config.PRINT_TIMEOUT_SECONDS,
+            )
+            print_status = "submitted"
+        except PrintError as exc:
+            log.error(
+                "Failed to print contract for account %s (saved+recorded, NOT printed - "
+                "reprint manually): %s",
+                account_number,
+                exc,
+            )
+            print_status = "failed"
+            print_detail = str(exc)
+    else:
+        print_status = "disabled"
+        print_detail = None
+
     # DEBUG: also dump the raw inputs for troubleshooting a bad merge
     # without re-triggering a real signature capture. Not the real save.
     debug_dir = Path(Config.RECEIVED_DUMP_DIR) / account_number
@@ -144,19 +173,21 @@ def receive_contract():
     (debug_dir / "meta.txt").write_text(
         f"account_number={account_number}\ncaptured_at={captured_at}\n"
         f"saved_at={saved_at.isoformat()}\nsaved_path={output_path}\n"
-        f"sha256={sha256_hash}\ndb_id={row_id}\n",
+        f"sha256={sha256_hash}\ndb_id={row_id}\n"
+        f"print_status={print_status}\nprint_detail={print_detail}\n",
         encoding="utf-8",
     )
 
     log.info(
         "Saved + recorded signed contract for account %s (captured %s, saved %s) -> %s "
-        "(sha256=%s, db_id=%s)",
+        "(sha256=%s, db_id=%s, print_status=%s)",
         account_number,
         captured_at,
         saved_at_text,
         output_path,
         sha256_hash,
         row_id,
+        print_status,
     )
     return (
         jsonify(
@@ -165,6 +196,8 @@ def receive_contract():
             path=str(output_path),
             sha256=sha256_hash,
             db_id=row_id,
+            print_status=print_status,
+            print_detail=print_detail,
         ),
         200,
     )
